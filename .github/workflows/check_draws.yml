@@ -1,0 +1,27 @@
+name: Update Express Entry Draws
+
+on:
+  schedule:
+    - cron: '0 20 * * *'   # Runs daily at 8 PM UTC (3 PM EST / 12 PM PST)
+  workflow_dispatch:         # Allows you to run it manually from GitHub
+
+jobs:
+  update-draws:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Check IRCC and update Gist if new draw found
+        run: python update_draws.py
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
