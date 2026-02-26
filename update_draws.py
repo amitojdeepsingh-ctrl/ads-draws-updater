@@ -1,39 +1,19 @@
 """
 ADS PathFinder — Automatic Express Entry Draw Updater
-Runs daily via GitHub Actions. Scrapes IRCC website and updates your Gist.
+Runs daily via GitHub Actions. Fetches IRCC JSON API and updates your Gist.
 """
 
 import json
 import os
 import re
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime
 
 GIST_ID       = "aad3e7558039efea6e8b107c66ab4ae9"
 GIST_FILENAME = "ads_pathfinder_config.json"
-IRCC_URL      = (
-    "https://www.canada.ca/en/immigration-refugees-citizenship/services/"
-    "immigrate-canada/express-entry/submit-profile/rounds-invitations.html"
-)
 
-# Map IRCC's full program names to the short names our app uses
-PROGRAM_MAP = {
-    "canadian experience class":              "Canadian Experience Class",
-    "federal skilled worker":                 "Federal Skilled Worker",
-    "federal skilled trades":                 "Federal Skilled Trades",
-    "provincial nominee program":             "Provincial Nominee Program",
-    "general":                                "General",
-    "healthcare and social services":         "Healthcare & Social Services",
-    "healthcare & social services":           "Healthcare & Social Services",
-    "healthcare occupations":                 "Healthcare & Social Services",
-    "french language proficiency":            "French Language Proficiency",
-    "stem occupations":                       "STEM Occupations",
-    "trade occupations":                      "Trade Occupations",
-    "transport occupations":                  "Transport Occupations",
-    "agriculture and agri-food occupations":  "Agriculture & Agri-Food",
-    "education occupations":                  "Education Occupations",
-}
+# IRCC publishes draw data as a JSON file — much more reliable than scraping HTML
+IRCC_JSON_URL = "https://www.canada.ca/content/dam/ircc/documents/json/ee_rounds_4_en.json"
 
 MONTH_ABBR = {
     "January": "Jan", "February": "Feb", "March": "Mar",
@@ -42,56 +22,73 @@ MONTH_ABBR = {
     "October": "Oct", "November": "Nov", "December":  "Dec",
 }
 
+# Map IRCC's drawName values to the short names our app uses
+PROGRAM_MAP = [
+    ("canadian experience class",              "Canadian Experience Class"),
+    ("federal skilled worker",                 "Federal Skilled Worker"),
+    ("federal skilled trades",                 "Federal Skilled Trades"),
+    ("french language proficiency",            "French Language Proficiency"),
+    ("healthcare and social services",         "Healthcare & Social Services"),
+    ("healthcare & social services",           "Healthcare & Social Services"),
+    ("healthcare occupations",                 "Healthcare & Social Services"),
+    ("physicians",                             "Healthcare & Social Services"),
+    ("stem occupations",                       "STEM Occupations"),
+    ("trade occupations",                      "Trade Occupations"),
+    ("transport occupations",                  "Transport Occupations"),
+    ("agriculture and agri-food",              "Agriculture & Agri-Food"),
+    ("education occupations",                  "Education Occupations"),
+    ("provincial nominee program",             "Provincial Nominee Program"),
+    ("general",                                "General"),
+]
+
 
 def format_date(date_str):
     """'February 17, 2026'  →  'Feb 17, 2026'"""
     for full, abbr in MONTH_ABBR.items():
         if full in date_str:
             return date_str.replace(full, abbr)
-    return date_str
+    return date_str.strip()
 
 
-def map_program(raw):
-    """Map IRCC program name to the name our app uses."""
-    lower = raw.lower().strip()
-    for key, val in PROGRAM_MAP.items():
+def map_program(draw_name):
+    """Map IRCC drawName to a clean short program name."""
+    lower = draw_name.lower()
+    for key, val in PROGRAM_MAP:
         if key in lower:
             return val
-    return raw.strip()
+    # Fallback: use first 40 chars of the draw name
+    return draw_name.split(",")[0].strip()[:40]
 
 
-def scrape_draws():
-    """Scrape the latest Express Entry draws from the IRCC website."""
+def fetch_draws():
+    """Fetch and parse the latest Express Entry draws from IRCC's JSON API."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ADS-PathFinder-Bot/1.0)"}
-    resp = requests.get(IRCC_URL, headers=headers, timeout=30)
+    resp = requests.get(IRCC_JSON_URL, headers=headers, timeout=30)
     resp.raise_for_status()
 
-    soup  = BeautifulSoup(resp.content, "html.parser")
-    table = soup.find("table")
-    if not table:
-        raise RuntimeError("Could not find draws table on IRCC page — layout may have changed.")
+    data = resp.json()
+    rounds = data.get("rounds", [])
+    if not rounds:
+        raise RuntimeError("IRCC JSON returned no rounds data.")
 
     draws = []
-    tbody = table.find("tbody") or table
-    for row in tbody.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 5:
-            continue
+    for r in rounds:
         try:
-            # Columns: round | date | draw type | CRS cutoff | invitations
-            date    = format_date(cells[1].get_text(strip=True))
-            program = map_program(cells[2].get_text(strip=True))
-            cutoff  = int(cells[3].get_text(strip=True).replace(",", ""))
-            invited = int(re.sub(r"[^\d]", "", cells[4].get_text(strip=True)))
+            cutoff  = int(str(r["drawCRS"]).replace(",", ""))
+            invited = int(re.sub(r"[^\d]", "", str(r["drawSize"])))
+            date    = format_date(r["drawDateFull"])
+            program = map_program(r.get("drawName", r.get("drawText2", "General")))
 
-            # Skip PNP-only draws (CRS 700+) — irrelevant for regular pool
-            if cutoff > 699:
+            # Skip special draws outside the normal CRS range
+            # (Physicians ~169, PNP ~700+)
+            if cutoff < 300 or cutoff > 699:
+                print(f"  Skipping draw {r.get('drawNumber','?')}: {program} CRS={cutoff}")
                 continue
 
             draws.append({"date": date, "program": program,
                           "cutoff": cutoff, "invited": invited})
-        except (ValueError, IndexError) as err:
-            print(f"  Warning: skipping row — {err}")
+        except (KeyError, ValueError) as err:
+            print(f"  Warning: skipping draw — {err}")
 
     return draws
 
@@ -129,10 +126,10 @@ def main():
     if not token:
         raise EnvironmentError("GIST_TOKEN secret is not set.")
 
-    print("Scraping IRCC website...")
-    fresh = scrape_draws()
+    print("Fetching IRCC draw data...")
+    fresh = fetch_draws()
     if not fresh:
-        raise RuntimeError("No draws parsed — check IRCC page structure.")
+        raise RuntimeError("No draws parsed from IRCC JSON.")
     print(f"  Found {len(fresh)} draws.")
 
     print("Fetching current Gist...")
@@ -148,19 +145,21 @@ def main():
 
     print(f"New draw detected!  {latest_current}  →  {latest_fresh}")
 
-    today = datetime.utcnow().strftime("%-b %-d, %Y")   # "Feb 26, 2026"
+    # strftime("%-d") uses no zero-padding on Linux (GitHub Actions runner)
+    today  = datetime.utcnow().strftime("%-b %-d, %Y")
     cutoff = cec_cutoff_approx(fresh)
 
     updated = {
-        "lastUpdated":    today,
+        "lastUpdated":     today,
         "cecCutoffApprox": cutoff,
-        "draws":          fresh[:15],                      # keep last 15
-        "pnpNotices":     current.get("pnpNotices", []),   # preserve manual PNP notices
+        "draws":           fresh[:15],                     # keep last 15
+        "pnpNotices":      current.get("pnpNotices", []), # preserve manual PNP notices
     }
 
     print(f"  CEC cutoff approx: {cutoff}")
     print(f"  Updating Gist with {len(updated['draws'])} draws...")
     update_gist(token, updated)
+    print("Done!")
 
 
 if __name__ == "__main__":
